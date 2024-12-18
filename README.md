@@ -43,6 +43,22 @@ pip install -r requirements.txt
 ```
 
 ---
+## Dataset Instructions
+
+1. **Download the Dataset**
+   - Download the dataset from the following link: [PEDRo Dataset](https://zenodo.org/records/13331985)
+
+2. **Extract the Dataset**
+   - Extract the downloaded dataset into a directory named `PEDro`.
+
+3. **Generate Additional Files**
+   - Run the `generate_script.py` file to preprocess or generate necessary files.
+     ```bash
+     python generate_script.py
+     ```
+
+Ensure the `PEDro` directory is correctly structured before proceeding to the next steps.
+---
 
 ## Running the Training Script
 
