@@ -1,0 +1,7 @@
+*.zip
+data/PEDRo/numpy
+data/PEDRo/xml
+data/PEDRo/yolo
+/venv
+/src/__pycache__
+/src/model/__pycache__
