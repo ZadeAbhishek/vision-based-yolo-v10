@@ -67,13 +67,13 @@ class PEDRoDataset(Dataset):
         combined_vtei[3] = vtei[3]  # Use i (intensity) as channel 4
 
         # Debugging: Print shape before padding
-        print(f"Shape before padding for {sample_name}: {combined_vtei.shape}")
+        #print(f"Shape before padding for {sample_name}: {combined_vtei.shape}")
 
         # Pad the tensor to ensure it has exactly T temporal frames
         combined_vtei = self.pad_tensor(combined_vtei)
 
         # Debugging: print tensor shape after padding
-        print(f"Shape after padding for {sample_name}: {combined_vtei.shape}")
+        #print(f"Shape after padding for {sample_name}: {combined_vtei.shape}")
 
         # Load YOLO-style labels
         label_path = os.path.join(self.label_dir, f"{sample_name}.txt")
