@@ -1,0 +1,15 @@
+\task: detect  # Detection task
+
+nc: 2  # Number of classes
+
+backbone:
+  - [-1, 1, Conv, [3, 16, 2, 1]]          # Input: 3 channels (RGB), Output: 16 channels, Kernel: 2x2, Stride: 1
+  - [-1, 1, Conv, [16, 32, 2, 2]]         # Downsample: 16 -> 32 channels, Kernel: 2x2, Stride: 2
+  - [-1, 1, Bottleneck, [32, 32]]         # Bottleneck: in_channels=32, out_channels=32
+  - [-1, 1, Conv, [32, 64, 2, 2]]         # Downsample: 32 -> 64 channels, Kernel: 2x2, Stride: 2
+  - [-1, 2, Bottleneck, [64, 64]]         # Bottleneck: in_channels=64, out_channels=64
+  - [-1, 1, Conv, [64, 128, 2, 2]]        # Downsample: 64 -> 128 channels, Kernel: 2x2, Stride: 2
+
+head:
+  - [-1, 1, Conv, [128, 64, 1, 1]]        # Reduce channels: 128 -> 64, Kernel: 1x1, Stride: 1
+  - [[-1], 1, Detect, [nc]]               # Detection layer with nc classes and in_channels=64

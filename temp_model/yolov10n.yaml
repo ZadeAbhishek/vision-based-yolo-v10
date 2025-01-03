@@ -1,0 +1,68 @@
+# ReYOLOv8s Configuration
+
+# Model structure
+model:
+  type: ReYOLOv8s
+  backbone:
+    - [Conv2D, 3, 24, 3, 1]  # Input Conv2D block
+    - [Conv2D, 24, 48, 3, 2]  # Downsampling Conv2D
+    - [C2f, 48, 48, 2]        # Bottlenecks C2f
+    - [ConvLSTM, 48, 48]      # Recurrent layer
+    - [Conv2D, 48, 88, 3, 2]  # Conv2D with downsampling
+    - [C2f, 88, 88, 3]        # Bottlenecks C2f
+    - [ConvLSTM, 88, 88]
+    - [Conv2D, 88, 176, 3, 2]
+    - [C2f, 176, 176, 3]
+    - [ConvLSTM, 176, 176]
+    - [SPFF, [176, 88], 264]  # Squeeze-and-Excitation block
+    - [Concat, [344, 176], 520]
+  neck:
+    - [Upsample, 176, scale=2]       # Upsample by 2
+    - [Concat, [176, 88], 264]       # Feature fusion
+    - [C2f, 264, 88, 2]             # Bottlenecks
+    - [Upsample, 88, scale=2]
+    - [Concat, [88, 176], 264]
+    - [C2f, 264, 88, 2]
+  head:
+    - [Conv2D, 88, 176, 3, 1]        # Detection layer Conv2D
+    - [Concat, [176, 344], 520]
+    - [C2f, 520, 344, 2]
+    - [Detect, [88, 176, 344]]       # Detection output
+
+# Number of classes
+nc: 80  # Number of classes in your dataset (update as per your use case)
+
+# Names of classes
+names: ['class1', 'class2', 'class3', ..., 'class80']  # Replace with your dataset's class names
+
+# Training hyperparameters
+train_hyperparameters:
+  lr0: 0.001
+  momentum: 0.937
+  weight_decay: 0.0005
+  warmup_epochs: 3
+  warmup_bias_lr: 0.05
+  box_loss_gain: 0.05
+  cls_loss_gain: 0.5
+  obj_loss_gain: 1.0
+  anchor_t: 4.0
+  fl_gamma: 0.0
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
+  mosaic: 1.0
+  mixup: 0.0
+
+# Input image size
+imgsz: 128  # Input image size
+
+# Batch size
+batch: 5
+
+# Number of epochs
+epochs: 50
