@@ -4,7 +4,7 @@ import os
 import logging
 import torch
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 import torch.nn as nn
 from dataset import PEDRoDataset  # Ensure this path is correct
 from model.AlternateV8 import ReYOLOv8s  # Ensure this path is correct
@@ -36,6 +36,9 @@ EPOCHS = 1  # Set to desired number of epochs
 LEARNING_RATE = 5e-5
 H, W, B = 260, 346, 5  # Image height, width, temporal bins
 NUM_CLASSES = None  # To be determined based on dataset categories
+train_limit = 2000
+val_limit = 2000
+test_limit = 2000
 
 # ---------------------------
 # Custom Collate Function
@@ -152,8 +155,12 @@ def train_model():
     """
     Main function to train the ReYOLOv8s model.
     """
-    # Initialize dataset with a limit of 2,000 samples
-    subset_size = 2000
+    # Define limit sizes
+    train_limit = 100
+    val_limit = 50
+    test_limit = 50
+
+    # Initialize training dataset with a limit
     try:
         train_dataset = PEDRoDataset(
             data_dir=DATA_DIR,
@@ -162,24 +169,41 @@ def train_model():
             W=W,
             B=B,
             transform=None,  # Add your transformation function if needed
-            limit=subset_size
+            limit=train_limit
         )
-        logging.info(f"Loaded {len(train_dataset)} samples for split 'train' with a limit of {subset_size}.")
+        logging.info(f"Loaded {len(train_dataset)} samples for split 'train' with a limit of {train_limit}.")
     except FileNotFoundError as e:
         logging.error(e)
         return
 
-    # Load validation and test datasets without limits
+    # Initialize validation dataset with a limit
     try:
-        val_dataset = PEDRoDataset(data_dir=DATA_DIR, split="val", H=H, W=W, B=B)
-        logging.info(f"Loaded {len(val_dataset)} samples for split 'val'.")
+        val_dataset = PEDRoDataset(
+            data_dir=DATA_DIR,
+            split="val",
+            H=H,
+            W=W,
+            B=B,
+            transform=None,  # Add your transformation function if needed
+            limit=val_limit
+        )
+        logging.info(f"Loaded {len(val_dataset)} samples for split 'val' with a limit of {val_limit}.")
     except FileNotFoundError as e:
         logging.error(e)
         return
 
+    # Initialize test dataset with a limit
     try:
-        test_dataset = PEDRoDataset(data_dir=DATA_DIR, split="test", H=H, W=W, B=B)
-        logging.info(f"Loaded {len(test_dataset)} samples for split 'test'.")
+        test_dataset = PEDRoDataset(
+            data_dir=DATA_DIR,
+            split="test",
+            H=H,
+            W=W,
+            B=B,
+            transform=None,  # Add your transformation function if needed
+            limit=test_limit
+        )
+        logging.info(f"Loaded {len(test_dataset)} samples for split 'test' with a limit of {test_limit}.")
     except FileNotFoundError as e:
         logging.error(e)
         return
