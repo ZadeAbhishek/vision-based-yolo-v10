@@ -1,3 +1,5 @@
+# src/train_model.py
+
 import os
 import logging
 import torch
@@ -22,17 +24,17 @@ logging.basicConfig(
 # ---------------------------
 # Device Configuration
 # ---------------------------
-DEVICE = "mps" if torch.backends.mps.is_available() else "cuda" if torch.cuda.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 logging.info(f"Using device: {DEVICE}")
 
 # ---------------------------
 # Hyperparameters and Configuration
 # ---------------------------
 DATA_DIR = "data/PEDRo/"  # Update as per your directory structure
-BATCH_SIZE = 2
-EPOCHS = 2  # Set to desired number of epochs
+BATCH_SIZE = 1  # Reduced to 1 to avoid CUDA OOM
+EPOCHS = 1  # Set to desired number of epochs
 LEARNING_RATE = 5e-5
-H, W, B = 64, 64, 5  # Image height, width, temporal bins
+H, W, B = 260, 346, 5  # Image height, width, temporal bins
 NUM_CLASSES = None  # To be determined based on dataset categories
 
 # ---------------------------
@@ -94,12 +96,16 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
     with torch.no_grad():
         for vtei, labels in loader:
             vtei = vtei.to(device)
-            class_logits, bbox_preds = model(vtei)
+            try:
+                class_logits, bbox_preds = model(vtei)
+            except Exception as e:
+                logging.error(f"Model forward pass error during evaluation: {e}")
+                continue
 
             obj_target, class_target, bbox_target = build_targets(class_logits, bbox_preds, labels, num_classes)
 
-            objectness_pred = class_logits[:, 0:1, :, :]
-            class_pred = class_logits[:, 1:, :, :]
+            objectness_pred = class_logits[:, :1, :, :]  # First channel for objectness
+            class_pred = class_logits[:, 1:, :, :]      # Remaining channels for class predictions
             loss_obj = obj_loss_fn(objectness_pred, obj_target)
 
             obj_mask = (obj_target.squeeze(1) == 1)
@@ -158,13 +164,25 @@ def train_model():
             transform=None,  # Add your transformation function if needed
             limit=subset_size
         )
+        logging.info(f"Loaded {len(train_dataset)} samples for split 'train' with a limit of {subset_size}.")
     except FileNotFoundError as e:
         logging.error(e)
         return
 
     # Load validation and test datasets without limits
-    val_dataset = PEDRoDataset(data_dir=DATA_DIR, split="val", H=H, W=W, B=B)
-    test_dataset = PEDRoDataset(data_dir=DATA_DIR, split="test", H=H, W=W, B=B)
+    try:
+        val_dataset = PEDRoDataset(data_dir=DATA_DIR, split="val", H=H, W=W, B=B)
+        logging.info(f"Loaded {len(val_dataset)} samples for split 'val'.")
+    except FileNotFoundError as e:
+        logging.error(e)
+        return
+
+    try:
+        test_dataset = PEDRoDataset(data_dir=DATA_DIR, split="test", H=H, W=W, B=B)
+        logging.info(f"Loaded {len(test_dataset)} samples for split 'test'.")
+    except FileNotFoundError as e:
+        logging.error(e)
+        return
 
     # Define class categories and number of classes
     OBJECT_CATEGORIES = train_dataset.object_categories
@@ -203,11 +221,13 @@ def train_model():
         num_workers=0
     )
 
-    # Initialize model without num_classes
+    # Initialize model with num_classes
     try:
-        model = ReYOLOv8s(in_channels=B).to(DEVICE)
+        model = ReYOLOv8s(in_channels=B, num_classes=NUM_CLASSES).to(DEVICE)
+        logging.info(f"Model initialized with in_channels={B} and num_classes={NUM_CLASSES}.")
     except TypeError as e:
         logging.error(f"Model initialization error: {e}")
+        logging.error("Ensure that ReYOLOv8s accepts 'in_channels' and 'num_classes' as arguments.")
         return
 
     # Calculate and log the number of million parameters
@@ -220,6 +240,8 @@ def train_model():
     obj_loss_fn = nn.BCEWithLogitsLoss()
     class_loss_fn = nn.CrossEntropyLoss()
     bbox_loss_fn = nn.SmoothL1Loss()
+
+    scaler = torch.cuda.amp.GradScaler()  # For mixed precision
 
     logging.info("Starting training...")
 
@@ -235,46 +257,59 @@ def train_model():
 
         for batch_idx, (vtei, labels) in enumerate(train_loader):
             vtei = vtei.to(DEVICE)
-            try:
-                class_logits, bbox_preds = model(vtei)
-            except Exception as e:
-                logging.error(f"Model forward pass error: {e}")
-                continue
+            optimizer.zero_grad()
 
-            # Build targets
-            obj_target, class_target, bbox_target = build_targets(class_logits, bbox_preds, labels, NUM_CLASSES)
+            with torch.cuda.amp.autocast():
+                try:
+                    class_logits, bbox_preds = model(vtei)
+                except RuntimeError as e:
+                    if 'out of memory' in str(e):
+                        logging.error("CUDA out of memory during forward pass. Skipping this batch.")
+                        torch.cuda.empty_cache()
+                        continue
+                    else:
+                        logging.error(f"Model forward pass error: {e}")
+                        torch.cuda.empty_cache()
+                        continue
+                except Exception as e:
+                    logging.error(f"Unexpected error during forward pass: {e}")
+                    torch.cuda.empty_cache()
+                    continue
 
-            # Compute losses
-            objectness_pred = class_logits[:, 0:1, :, :]
-            class_pred = class_logits[:, 1:, :, :]
-            loss_obj = obj_loss_fn(objectness_pred, obj_target)
+                # Build targets
+                obj_target, class_target, bbox_target = build_targets(class_logits, bbox_preds, labels, NUM_CLASSES)
 
-            obj_mask = (obj_target.squeeze(1) == 1)
-            class_indices = class_target.argmax(dim=1)
-            if obj_mask.sum() > 0:
-                class_pred_obj = class_pred.permute(0, 2, 3, 1)[obj_mask]
-                class_gt_obj = class_indices[obj_mask]
-                loss_cls = class_loss_fn(class_pred_obj, class_gt_obj)
-            else:
-                loss_cls = torch.tensor(0.0, device=DEVICE)
+                # Compute losses
+                objectness_pred = class_logits[:, :1, :, :]  # First channel for objectness
+                class_pred = class_logits[:, 1:, :, :]      # Remaining channels for class predictions
+                loss_obj = obj_loss_fn(objectness_pred, obj_target)
 
-            if obj_mask.sum() > 0:
-                bbox_pred_obj = bbox_preds.permute(0, 2, 3, 1)[obj_mask]
-                bbox_gt_obj = bbox_target.permute(0, 2, 3, 1)[obj_mask]
-                loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj)
-            else:
-                loss_bbox = torch.tensor(0.0, device=DEVICE)
+                obj_mask = (obj_target.squeeze(1) == 1)
+                class_indices = class_target.argmax(dim=1)
+                if obj_mask.sum() > 0:
+                    class_pred_obj = class_pred.permute(0, 2, 3, 1)[obj_mask]
+                    class_gt_obj = class_indices[obj_mask]
+                    loss_cls = class_loss_fn(class_pred_obj, class_gt_obj)
+                else:
+                    loss_cls = torch.tensor(0.0, device=DEVICE)
 
-            loss = loss_obj + loss_cls + loss_bbox
+                if obj_mask.sum() > 0:
+                    bbox_pred_obj = bbox_preds.permute(0, 2, 3, 1)[obj_mask]
+                    bbox_gt_obj = bbox_target.permute(0, 2, 3, 1)[obj_mask]
+                    loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj)
+                else:
+                    loss_bbox = torch.tensor(0.0, device=DEVICE)
+
+                loss = loss_obj + loss_cls + loss_bbox
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+
             epoch_loss += loss.item()
             epoch_obj_loss += loss_obj.item()
             epoch_class_loss += loss_cls.item()
             epoch_bbox_loss += loss_bbox.item()
-
-            # Backpropagation
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
 
             # Log ground truth objects
             gt_xml = [obj['name'] for obj in labels['xml']]
