@@ -1,0 +1,7 @@
+# data/custom.yaml
+
+train: data/PEDRo/train/images
+val: data/PEDRo/val/images
+
+nc: 2
+names: ['class0', 'class1']  # Update with your class names
