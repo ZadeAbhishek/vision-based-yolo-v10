@@ -9,9 +9,7 @@ import logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    handlers=[
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
 
 class PEDRoDataset(Dataset):
@@ -49,7 +47,6 @@ class PEDRoDataset(Dataset):
             else:
                 self.samples = self.samples[:limit]
                 logging.info(f"Loaded {len(self.samples)} samples for split '{split}' with a limit of {limit}.")
-
         else:
             logging.info(f"Loaded {len(self.samples)} samples for split '{split}'.")
 

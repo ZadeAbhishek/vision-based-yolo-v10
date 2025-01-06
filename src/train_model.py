@@ -9,6 +9,8 @@ import torch.nn as nn
 from dataset import PEDRoDataset  # Ensure this path is correct
 from model.AlternateV8 import ReYOLOv8s  # Ensure this path is correct
 import numpy as np
+import torch.nn.functional as F
+
 
 # ---------------------------
 # Configure Logging
@@ -33,13 +35,10 @@ logging.info(f"Using device: {DEVICE}")
 # ---------------------------
 DATA_DIR = "data/PEDRo/"  # Update as per your directory structure
 BATCH_SIZE = 1  # Reduced to 1 to avoid CUDA OOM
-EPOCHS = 1  # Set to desired number of epochs
-LEARNING_RATE = 5e-5
+EPOCHS = 10  # Set to desired number of epochs
+LEARNING_RATE = 1e-5
 H, W, B = 260, 346, 5  # Image height, width, temporal bins
 NUM_CLASSES = None  # To be determined based on dataset categories
-train_limit = 2000
-val_limit = 2000
-test_limit = 2000
 
 # ---------------------------
 # Custom Collate Function
@@ -59,13 +58,9 @@ def custom_collate_fn(batch):
 
 # ---------------------------
 # Placeholder for YOLO-style Target Assignment
-# ---------------------------
-import torch
-import torch.nn.functional as F
-
 def build_targets(class_logits, bbox_preds, labels, num_classes):
     """
-    Builds the targets for loss calculation.
+    Builds the targets for YOLO-style loss calculation.
 
     Args:
         class_logits (Tensor): The logits from the model for each class.
@@ -76,51 +71,52 @@ def build_targets(class_logits, bbox_preds, labels, num_classes):
     Returns:
         tuple: Objectness target, class target, and bounding box target.
     """
-    obj_target = torch.zeros_like(class_logits[:, :1, :, :])  # Ensure single channel for objectness
-    class_target = torch.zeros_like(class_logits)  # Initializing class target
-    bbox_target = torch.zeros_like(bbox_preds)  # Initializing bounding box target
+    # Get batch size and grid dimensions from class_logits
+    batch_size, _, grid_h, grid_w = class_logits.shape
 
-    # Iterate over all the image annotations
-    for key in labels:
-        for b in range(len(labels[key])):  # Iterate through each annotation for the given key
-            if key == 'yolo':
-                category_id = labels[key][b]['category_id']
-                bbox = labels[key][b]['bbox']
-                # Normalize or convert bbox to a tensor and reshape as needed
-                gt_boxes = torch.tensor([bbox], dtype=torch.float32)  # Assuming normalized bbox
+    # Initialize target tensors
+    obj_target = torch.zeros((batch_size, 1, grid_h, grid_w), device=class_logits.device)
+    class_target = torch.zeros((batch_size, num_classes, grid_h, grid_w), device=class_logits.device)
+    bbox_target = torch.zeros((batch_size, 4, grid_h, grid_w), device=class_logits.device)
 
-            elif key == 'xml':
-                # For XML annotations, parse the bounding box and category
-                name = labels[key][b]['name']
-                category_id = get_category_id_from_name(name, num_classes)  # Function to map category name to id
-                bbox = labels[key][b]['bbox']
-                gt_boxes = torch.tensor([bbox], dtype=torch.float32)
+    # Iterate over the batch
+    for b in range(batch_size):
+        for key in labels:
+            for annotation in labels[key]:
+                if key == 'yolo':
+                    category_id = annotation['category_id']
+                    bbox = annotation['bbox']  # Assumes normalized bbox [x_center, y_center, width, height]
+                elif key == 'xml':
+                    category_id = get_category_id_from_name(annotation['name'], num_classes)
+                    bbox = annotation['bbox']  # Assumes normalized bbox [x_center, y_center, width, height]
+                else:
+                    continue
 
-            # Ensure the bbox has 4 values for the 4 coordinates (xmin, ymin, xmax, ymax)
-            gt_boxes = gt_boxes.view(-1)  # Flatten to ensure it's a 1D tensor with 4 values
+                # Convert bbox to tensor
+                gt_bbox = torch.tensor(bbox, dtype=torch.float32, device=class_logits.device)
 
-            # Now update the targets based on the parsed information
-            obj_target[b, 0, :, :] = 1  # Example object target assignment, assuming the whole grid is an object
-            class_target[b, :, :, :] = category_id  # Assign the category ID to the class target
+                # Determine grid cell for bbox center
+                grid_x = int(gt_bbox[0] * grid_w)
+                grid_y = int(gt_bbox[1] * grid_h)
 
-            # Calculate grid positions
-            # Example: use the center of the bounding box to determine the grid location
-            # You need to scale the bounding box to the grid dimensions (1040x1384)
-            grid_x = int(gt_boxes[0] * class_logits.shape[3])  # Scale xmin to grid width
-            grid_y = int(gt_boxes[1] * class_logits.shape[2])  # Scale ymin to grid height
+                # Ensure grid coordinates are within bounds
+                grid_x = min(max(grid_x, 0), grid_w - 1)
+                grid_y = min(max(grid_y, 0), grid_h - 1)
 
-            # Ensure grid coordinates are within bounds
-            grid_x = min(max(grid_x, 0), class_logits.shape[3] - 1)
-            grid_y = min(max(grid_y, 0), class_logits.shape[2] - 1)
+                # Update objectness target (object present at grid cell)
+                obj_target[b, 0, grid_y, grid_x] = 1
 
-            # Assign the bounding box to the target grid location
-            # Each grid cell needs 4 values, so we assign the 4 values of the bounding box
-            bbox_target[b, 0, grid_y, grid_x] = gt_boxes[0]  # xmin
-            bbox_target[b, 1, grid_y, grid_x] = gt_boxes[1]  # ymin
-            bbox_target[b, 2, grid_y, grid_x] = gt_boxes[2]  # xmax
-            bbox_target[b, 3, grid_y, grid_x] = gt_boxes[3]  # ymax
+                # Update class target (one-hot encoding for category)
+                class_target[b, category_id, grid_y, grid_x] = 1
+
+                # Update bounding box target
+                bbox_target[b, 0, grid_y, grid_x] = gt_bbox[0] * grid_w - grid_x  # x offset within the grid cell
+                bbox_target[b, 1, grid_y, grid_x] = gt_bbox[1] * grid_h - grid_y  # y offset within the grid cell
+                bbox_target[b, 2, grid_y, grid_x] = gt_bbox[2]                   # width (normalized)
+                bbox_target[b, 3, grid_y, grid_x] = gt_bbox[3]                   # height (normalized)
 
     return obj_target, class_target, bbox_target
+
 
 
 
@@ -169,7 +165,7 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
     model.eval()
     total_loss, total_obj_loss, total_class_loss, total_bbox_loss = 0, 0, 0, 0
     with torch.no_grad():
-        for vtei, labels in loader:
+        for idx, (vtei, labels) in enumerate(loader):
             vtei = vtei.to(device)
             try:
                 class_logits, bbox_preds = model(vtei)
@@ -181,7 +177,7 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
 
             objectness_pred = class_logits[:, :1, :, :]  # First channel for objectness
             class_pred = class_logits[:, 1:, :, :]
-            class_pred = F.softmax(class_pred, dim=1)      # Remaining channels for class predictions
+            class_pred = F.softmax(class_pred, dim=1)  # Remaining channels for class predictions
             loss_obj = obj_loss_fn(objectness_pred, obj_target)
 
             obj_mask = (obj_target.squeeze(1) == 1)
@@ -195,8 +191,11 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
 
             if obj_mask.sum() > 0:
                 bbox_pred_obj = bbox_preds.permute(0, 2, 3, 1)[obj_mask]
+                bbox_pred_obj = bbox_pred_obj[:, :4]
                 bbox_gt_obj = bbox_target.permute(0, 2, 3, 1)[obj_mask]
-                loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj)
+                bbox_gt_obj = bbox_gt_obj[:, :4] 
+                #bbox_pred_obj = bbox_pred_obj[:, :4] 
+                loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj) / 1000
             else:
                 loss_bbox = torch.tensor(0.0, device=device)
 
@@ -206,24 +205,15 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
             total_class_loss += loss_cls.item()
             total_bbox_loss += loss_bbox.item()
 
-            # Log ground truth objects and predicted classes
-            if 'OBJECT_CATEGORIES' in globals() and OBJECT_CATEGORIES:
-                gt_xml = [obj['name'] for obj in labels['xml']]
-                gt_yolo = [OBJECT_CATEGORIES[int(obj['category_id'])] for obj in labels['yolo']]
-                logging.info(f"{phase} - Ground Truth XML: {gt_xml}")
-                logging.info(f"{phase} - Ground Truth YOLO: {gt_yolo}")
-
-            # Extract ground truth and predicted classes for logging
-            gt_classes = np.array([obj['category_id'] for obj in labels['yolo']])  # Ground truth classes
+            # Log ground truth and predicted classes
+            gt_classes = [obj['category_id'] for obj in labels['yolo']]  # Ground truth classes
             pred_classes = class_pred.argmax(dim=1).cpu().numpy()  # Predicted classes based on max logit
 
-            for j in range(len(gt_classes)):  # Loop over all ground truth classes
-                try:
-                    gt_class = gt_classes[j]  # Ground truth class
-                    pred_class = pred_classes[j]  # Predicted class
-                    logging.info(f"{phase} - Image {j+1}: GT Class: {gt_class}, Pred Class: {pred_class}")
-                except IndexError:
-                    logging.error(f"Index {j} out of bounds for gt_classes with size {len(gt_classes)}")
+            # Extract the predicted class with the highest confidence per image
+            pred_classes_per_image = [pred_class.max() for pred_class in pred_classes]
+
+            for image_idx, (gt_class, pred_class) in enumerate(zip(gt_classes, pred_classes_per_image)):
+                logging.info(f"{phase} - Image {image_idx + 1}: GT Class: {gt_class}, Pred Class: {pred_class}")
 
     average_loss = total_loss / len(loader)
     average_obj_loss = total_obj_loss / len(loader)
@@ -245,7 +235,7 @@ def train_model():
     Main function to train the ReYOLOv8s model.
     """
     # Define limit sizes
-    train_limit = 10
+    train_limit = 100
     val_limit = 5
     test_limit = 5
 
@@ -305,7 +295,7 @@ def train_model():
 
     if NUM_CLASSES == 0:
         # Define default classes or load from a file
-        OBJECT_CATEGORIES = ['person', 'car', 'bicycle']  # Example classes
+        OBJECT_CATEGORIES = ['person','no-person']  # Example classes
         NUM_CLASSES = len(OBJECT_CATEGORIES)
         logging.info("Default OBJECT_CATEGORIES set.")
         logging.info(f"Number of classes: {NUM_CLASSES}")
@@ -354,7 +344,7 @@ def train_model():
     class_loss_fn = nn.CrossEntropyLoss()
     bbox_loss_fn = nn.SmoothL1Loss()
 
-    scaler = torch.cuda.amp.GradScaler()  # For mixed precision
+    scaler = torch.amp.GradScaler()  # For mixed precision
 
     logging.info("Starting training...")
 
@@ -408,8 +398,11 @@ def train_model():
 
                 if obj_mask.sum() > 0:
                     bbox_pred_obj = bbox_preds.permute(0, 2, 3, 1)[obj_mask]
+                    bbox_pred_obj = bbox_pred_obj[:, :4]
                     bbox_gt_obj = bbox_target.permute(0, 2, 3, 1)[obj_mask]
-                    loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj)
+                    bbox_gt_obj = bbox_gt_obj[:, :4] 
+                    #bbox_pred_obj = bbox_pred_obj[:, :4] 
+                    loss_bbox = bbox_loss_fn(bbox_pred_obj, bbox_gt_obj) / 1000
                 else:
                     loss_bbox = torch.tensor(0.0, device=DEVICE)
 
