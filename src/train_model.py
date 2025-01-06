@@ -8,6 +8,7 @@ from torch.utils.data import DataLoader, Subset
 import torch.nn as nn
 from dataset import PEDRoDataset  # Ensure this path is correct
 from model.AlternateV8 import ReYOLOv8s  # Ensure this path is correct
+import numpy as np
 
 # ---------------------------
 # Configure Logging
@@ -59,46 +60,91 @@ def custom_collate_fn(batch):
 # ---------------------------
 # Placeholder for YOLO-style Target Assignment
 # ---------------------------
+import torch
+import torch.nn.functional as F
+
 def build_targets(class_logits, bbox_preds, labels, num_classes):
     """
-    YOLO-style target assignment.
-    Converts ground truth boxes and classes into target tensors aligned with the YOLO output grid.
+    Builds the targets for loss calculation.
+
+    Args:
+        class_logits (Tensor): The logits from the model for each class.
+        bbox_preds (Tensor): The bounding box predictions from the model.
+        labels (Dict): The ground truth labels containing different formats.
+        num_classes (int): The number of classes.
+
+    Returns:
+        tuple: Objectness target, class target, and bounding box target.
     """
-    B, _, H_out, W_out = class_logits.shape
-    obj_target = torch.zeros(B, 1, H_out, W_out, device=class_logits.device)
-    class_target = torch.zeros(B, num_classes, H_out, W_out, device=class_logits.device)
-    bbox_target = torch.zeros(B, 4, H_out, W_out, device=class_logits.device)
+    obj_target = torch.zeros_like(class_logits[:, :1, :, :])  # Ensure single channel for objectness
+    class_target = torch.zeros_like(class_logits)  # Initializing class target
+    bbox_target = torch.zeros_like(bbox_preds)  # Initializing bounding box target
 
-    for b in range(B):  # Iterate over each batch
-        if "yolo" not in labels or not labels["yolo"]:
-            continue  # Skip if no labels are present for this sample
-        
-        for box in labels["yolo"]:
-            # Extract box details
-            cx, cy, w, h = box["bbox"]  # Center x, Center y, Width, Height (normalized)
-            class_id = box["category_id"]  # Class index
+    # Iterate over all the image annotations
+    for key in labels:
+        for b in range(len(labels[key])):  # Iterate through each annotation for the given key
+            if key == 'yolo':
+                category_id = labels[key][b]['category_id']
+                bbox = labels[key][b]['bbox']
+                # Normalize or convert bbox to a tensor and reshape as needed
+                gt_boxes = torch.tensor([bbox], dtype=torch.float32)  # Assuming normalized bbox
 
-            # Map center to grid cell
-            grid_x = int(cx * W_out)  # Grid cell x
-            grid_y = int(cy * H_out)  # Grid cell y
+            elif key == 'xml':
+                # For XML annotations, parse the bounding box and category
+                name = labels[key][b]['name']
+                category_id = get_category_id_from_name(name, num_classes)  # Function to map category name to id
+                bbox = labels[key][b]['bbox']
+                gt_boxes = torch.tensor([bbox], dtype=torch.float32)
 
-            # Calculate offsets within the grid cell
-            offset_x = (cx * W_out) - grid_x
-            offset_y = (cy * H_out) - grid_y
+            # Ensure the bbox has 4 values for the 4 coordinates (xmin, ymin, xmax, ymax)
+            gt_boxes = gt_boxes.view(-1)  # Flatten to ensure it's a 1D tensor with 4 values
 
-            # Assign objectness target
-            obj_target[b, 0, grid_y, grid_x] = 1.0
+            # Now update the targets based on the parsed information
+            obj_target[b, 0, :, :] = 1  # Example object target assignment, assuming the whole grid is an object
+            class_target[b, :, :, :] = category_id  # Assign the category ID to the class target
 
-            # Assign class target (one-hot encoded)
-            class_target[b, class_id, grid_y, grid_x] = 1.0
+            # Calculate grid positions
+            # Example: use the center of the bounding box to determine the grid location
+            # You need to scale the bounding box to the grid dimensions (1040x1384)
+            grid_x = int(gt_boxes[0] * class_logits.shape[3])  # Scale xmin to grid width
+            grid_y = int(gt_boxes[1] * class_logits.shape[2])  # Scale ymin to grid height
 
-            # Assign bbox target (tx, ty, tw, th)
-            bbox_target[b, 0, grid_y, grid_x] = offset_x
-            bbox_target[b, 1, grid_y, grid_x] = offset_y
-            bbox_target[b, 2, grid_y, grid_x] = w
-            bbox_target[b, 3, grid_y, grid_x] = h
+            # Ensure grid coordinates are within bounds
+            grid_x = min(max(grid_x, 0), class_logits.shape[3] - 1)
+            grid_y = min(max(grid_y, 0), class_logits.shape[2] - 1)
+
+            # Assign the bounding box to the target grid location
+            # Each grid cell needs 4 values, so we assign the 4 values of the bounding box
+            bbox_target[b, 0, grid_y, grid_x] = gt_boxes[0]  # xmin
+            bbox_target[b, 1, grid_y, grid_x] = gt_boxes[1]  # ymin
+            bbox_target[b, 2, grid_y, grid_x] = gt_boxes[2]  # xmax
+            bbox_target[b, 3, grid_y, grid_x] = gt_boxes[3]  # ymax
 
     return obj_target, class_target, bbox_target
+
+
+
+
+
+
+def get_category_id_from_name(name, num_classes):
+    """
+    Map the category name to an ID based on your dataset. 
+    You can customize this function based on the category names in your dataset.
+
+    Args:
+        name (str): The category name from the XML data.
+        num_classes (int): The total number of classes in the dataset.
+
+    Returns:
+        int: The category ID corresponding to the category name.
+    """
+    category_map = {
+        'person': 0,  # Assuming 'person' is category 0, you can extend this for other classes.
+        # Add more mappings as needed
+    }
+    return category_map.get(name, -1)  # Return -1 if the name doesn't exist in the map
+
 
 # ---------------------------
 # Evaluation Function
@@ -134,7 +180,8 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
             obj_target, class_target, bbox_target = build_targets(class_logits, bbox_preds, labels, num_classes)
 
             objectness_pred = class_logits[:, :1, :, :]  # First channel for objectness
-            class_pred = class_logits[:, 1:, :, :]      # Remaining channels for class predictions
+            class_pred = class_logits[:, 1:, :, :]
+            class_pred = F.softmax(class_pred, dim=1)      # Remaining channels for class predictions
             loss_obj = obj_loss_fn(objectness_pred, obj_target)
 
             obj_mask = (obj_target.squeeze(1) == 1)
@@ -159,12 +206,24 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
             total_class_loss += loss_cls.item()
             total_bbox_loss += loss_bbox.item()
 
-            # Log ground truth objects
+            # Log ground truth objects and predicted classes
             if 'OBJECT_CATEGORIES' in globals() and OBJECT_CATEGORIES:
                 gt_xml = [obj['name'] for obj in labels['xml']]
                 gt_yolo = [OBJECT_CATEGORIES[int(obj['category_id'])] for obj in labels['yolo']]
-                logging.debug(f"{phase} - Ground Truth XML: {gt_xml}")
-                logging.debug(f"{phase} - Ground Truth YOLO: {gt_yolo}")
+                logging.info(f"{phase} - Ground Truth XML: {gt_xml}")
+                logging.info(f"{phase} - Ground Truth YOLO: {gt_yolo}")
+
+            # Extract ground truth and predicted classes for logging
+            gt_classes = np.array([obj['category_id'] for obj in labels['yolo']])  # Ground truth classes
+            pred_classes = class_pred.argmax(dim=1).cpu().numpy()  # Predicted classes based on max logit
+
+            for j in range(len(gt_classes)):  # Loop over all ground truth classes
+                try:
+                    gt_class = gt_classes[j]  # Ground truth class
+                    pred_class = pred_classes[j]  # Predicted class
+                    logging.info(f"{phase} - Image {j+1}: GT Class: {gt_class}, Pred Class: {pred_class}")
+                except IndexError:
+                    logging.error(f"Index {j} out of bounds for gt_classes with size {len(gt_classes)}")
 
     average_loss = total_loss / len(loader)
     average_obj_loss = total_obj_loss / len(loader)
@@ -174,6 +233,10 @@ def evaluate_model(model, loader, obj_loss_fn, class_loss_fn, bbox_loss_fn, devi
                  f"Classification: {average_class_loss:.4f} | BBox: {average_bbox_loss:.4f}")
     return average_loss
 
+
+
+
+
 # ---------------------------
 # Training Function
 # ---------------------------
@@ -182,9 +245,9 @@ def train_model():
     Main function to train the ReYOLOv8s model.
     """
     # Define limit sizes
-    train_limit = 100
-    val_limit = 50
-    test_limit = 50
+    train_limit = 10
+    val_limit = 5
+    test_limit = 5
 
     # Initialize training dataset with a limit
     try:
@@ -364,8 +427,8 @@ def train_model():
             # Log ground truth objects
             gt_xml = [obj['name'] for obj in labels['xml']]
             gt_yolo = [OBJECT_CATEGORIES[int(obj['category_id'])] for obj in labels['yolo']]
-            logging.debug(f"Train Epoch {epoch+1} Batch {batch_idx}: Ground Truth XML: {gt_xml}")
-            logging.debug(f"Train Epoch {epoch+1} Batch {batch_idx}: Ground Truth YOLO: {gt_yolo}")
+           # logging.info(f"Train Epoch {epoch+1} Batch {batch_idx}: Ground Truth XML: {gt_xml}")
+            logging.info(f"Train Epoch {epoch+1} Batch {batch_idx}: Ground Truth YOLO: {gt_yolo}")
 
             if batch_idx % 10 == 0:
                 logging.info(f"Epoch {epoch+1}/{EPOCHS}, Batch {batch_idx}, Loss: {loss.item():.4f}")
